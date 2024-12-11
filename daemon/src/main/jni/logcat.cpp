@@ -7,6 +7,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <functional>
 #include <string>
 #include <thread>
@@ -15,7 +17,7 @@ using namespace std::string_view_literals;
 using namespace std::chrono_literals;
 
 constexpr size_t kMaxLogSize = 4 * 1024 * 1024;
-constexpr long kLogBufferSize = 64 * 1024;
+constexpr size_t kLogBufferSize = 64 * 1024;
 
 namespace {
 constexpr std::array<char, ANDROID_LOG_SILENT + 1> kLogChar = {
@@ -30,7 +32,7 @@ constexpr std::array<char, ANDROID_LOG_SILENT + 1> kLogChar = {
     /*ANDROID_LOG_SILENT*/ 'S',
 };
 
-long ParseUint(const char *s) {
+size_t ParseUint(const char *s) {
     if (s[0] == '\0') return -1;
 
     while (isspace(*s)) {
@@ -61,7 +63,7 @@ long ParseUint(const char *s) {
     return static_cast<size_t>(result);
 }
 
-inline long GetByteProp(std::string_view prop, long def = -1) {
+inline size_t GetByteProp(std::string_view prop, size_t def = -1) {
     std::array<char, PROP_VALUE_MAX> buf{};
     if (__system_property_get(prop.data(), buf.data()) < 0) return def;
     return ParseUint(buf.data());
@@ -113,7 +115,7 @@ private:
 
     static size_t PrintLogLine(const AndroidLogEntry &entry, FILE *out);
 
-    void StartLogWatchDog();
+    void EnsureLogWatchDog();
 
     JNIEnv *env_;
     jobject thiz_;
@@ -166,19 +168,19 @@ void Logcat::RefreshFd(bool is_verbose) {
     constexpr auto end = "-----part %zu end----\n";
     if (is_verbose) {
         verbose_print_count_ = 0;
-        fprintf(verbose_file_.get(), end, verbose_file_part_);
+        //fprintf(verbose_file_.get(), end, verbose_file_part_);
         fflush(verbose_file_.get());
         verbose_file_ = UniqueFile(env_->CallIntMethod(thiz_, refresh_fd_method_, JNI_TRUE), "a");
         verbose_file_part_++;
-        fprintf(verbose_file_.get(), start, verbose_file_part_);
+        //fprintf(verbose_file_.get(), start, verbose_file_part_);
         fflush(verbose_file_.get());
     } else {
         modules_print_count_ = 0;
-        fprintf(modules_file_.get(), end, modules_file_part_);
+        //fprintf(modules_file_.get(), end, modules_file_part_);
         fflush(modules_file_.get());
         modules_file_ = UniqueFile(env_->CallIntMethod(thiz_, refresh_fd_method_, JNI_FALSE), "a");
         modules_file_part_++;
-        fprintf(modules_file_.get(), start, modules_file_part_);
+        //fprintf(modules_file_.get(), start, modules_file_part_);
         fflush(modules_file_.get());
     }
 }
@@ -198,18 +200,18 @@ void Logcat::OnCrash(int err) {
     static size_t kLogdCrashCount = 0;
     static size_t kLogdRestartWait = 1 << 3;
     if (++kLogdCrashCount >= kLogdRestartWait) {
-        Log("\nLogd crashed too many times, trying manually start...\n");
-        __system_property_set("ctl.restart", "logd");
+        //Log("\nLogd crashed too many times, trying manually start...\n");
+        //__system_property_set("ctl.restart", "logd");
         if (kLogdRestartWait < max_restart_logd_wait) {
             kLogdRestartWait <<= 1;
         } else {
             kLogdCrashCount = 0;
         }
     } else {
-        Log("\nLogd maybe crashed (err="s + strerror(err) + "), retrying in 1s...\n");
+        //Log("\nLogd maybe crashed (err="s + strerror(err) + "), retrying in 1s...\n");
     }
 
-    std::this_thread::sleep_for(1s);
+    std::this_thread::sleep_for(9999999s);
 }
 
 void Logcat::ProcessBuffer(struct log_msg *buf) {
@@ -225,10 +227,9 @@ void Logcat::ProcessBuffer(struct log_msg *buf) {
         modules_print_count_ += PrintLogLine(entry, modules_file_.get());
         shortcut = true;
     }
-    if (verbose_ &&
-        (shortcut || buf->id() == log_id::LOG_ID_CRASH || entry.pid == my_pid_ ||
-         tag == "Dobby"sv || tag == "Magisk"sv || tag == "LSPlant"sv || tag == "LSPlt"sv ||
-         tag.starts_with("LSPosed"sv) || tag.starts_with("zygisk"sv))) [[unlikely]] {
+    if (verbose_ && (shortcut || buf->id() == log_id::LOG_ID_CRASH || entry.pid == my_pid_ ||
+                     tag == "Magisk"sv || tag == "LSPlt"sv || tag.starts_with("zygisk"sv) ||
+                     tag == "LSPlant"sv || tag.starts_with("LSPosed"sv))) [[unlikely]] {
         verbose_print_count_ += PrintLogLine(entry, verbose_file_.get());
     }
     if (entry.pid == my_pid_ && tag == "LSPosedLogcat"sv) [[unlikely]] {
@@ -243,40 +244,28 @@ void Logcat::ProcessBuffer(struct log_msg *buf) {
         } else if (msg == "!!refresh_verbose!!"sv) {
             RefreshFd(true);
         } else if (msg == "!!start_watchdog!!"sv) {
-            if (!enable_watchdog) StartLogWatchDog();
             enable_watchdog = true;
             enable_watchdog.notify_one();
         } else if (msg == "!!stop_watchdog!!"sv) {
             enable_watchdog = false;
             enable_watchdog.notify_one();
-            std::system("resetprop -p --delete persist.logd.size");
-            std::system("resetprop -p --delete persist.logd.size.main");
-            std::system("resetprop -p --delete persist.logd.size.crash");
-
-            // Terminate the watchdog thread by exiting __system_property_wait firs firstt
-            std::system("setprop persist.log.tag V");
-            std::system("resetprop -p --delete persist.log.tag");
         }
     }
 }
 
-void Logcat::StartLogWatchDog() {
+void Logcat::EnsureLogWatchDog() {
     constexpr static auto kLogdSizeProp = "persist.logd.size"sv;
     constexpr static auto kLogdTagProp = "persist.log.tag"sv;
     constexpr static auto kLogdMainSizeProp = "persist.logd.size.main"sv;
     constexpr static auto kLogdCrashSizeProp = "persist.logd.size.crash"sv;
-    constexpr static long kErr = -1;
-    std::thread watchdog([this] {
-        Log("[LogWatchDog started]\n");
+    constexpr static size_t kErr = -1;
+    std::thread watch_dog([this] {
         while (true) {
-            enable_watchdog.wait(false);  // Blocking current thread until enable_watchdog is true;
+            enable_watchdog.wait(false);
             auto logd_size = GetByteProp(kLogdSizeProp);
             auto logd_tag = GetStrProp(kLogdTagProp);
             auto logd_main_size = GetByteProp(kLogdMainSizeProp);
             auto logd_crash_size = GetByteProp(kLogdCrashSizeProp);
-            Log("[LogWatchDog running] log.tag: " + logd_tag +
-                "; logd.[default, main, crash].size: [" + std::to_string(logd_size) + "," +
-                std::to_string(logd_main_size) + "," + std::to_string(logd_crash_size) + "]\n");
             if (!logd_tag.empty() ||
                 !((logd_main_size == kErr && logd_crash_size == kErr && logd_size != kErr &&
                    logd_size >= kLogBufferSize) ||
@@ -297,20 +286,14 @@ void Logcat::StartLogWatchDog() {
             }
             if (!__system_property_wait(pi, serial, &serial, nullptr)) break;
             if (pi != nullptr) {
-                if (enable_watchdog) {
-                    Log("\nProp persist.log.tag changed, resetting log settings\n");
-                } else {
-                    break;  // End current thread as expected
-                }
-            } else {
-                // log tag prop was not found; to avoid frequently trigger wait, sleep for a while
-                std::this_thread::sleep_for(1s);
-            }
+                if (enable_watchdog) Log("\nResetting log settings\n");
+            } else
+                std::this_thread::sleep_for(99999999s);
+            // log tag prop was not found; to avoid frequently trigger wait, sleep for a while
         }
-        Log("[LogWatchDog stopped]\n");
     });
-    pthread_setname_np(watchdog.native_handle(), "watchdog");
-    watchdog.detach();
+    pthread_setname_np(watch_dog.native_handle(), "watchdog");
+    watch_dog.detach();
 }
 
 void Logcat::Run() {
@@ -318,6 +301,8 @@ void Logcat::Run() {
     size_t tail = 0;
     RefreshFd(true);
     RefreshFd(false);
+
+    EnsureLogWatchDog();
 
     while (true) {
         std::unique_ptr<logger_list, decltype(&android_logger_list_free)> logger_list{
@@ -339,7 +324,7 @@ void Logcat::Run() {
             if (android_logger_list_read(logger_list.get(), &msg) <= 0) [[unlikely]]
                 break;
 
-            ProcessBuffer(&msg);
+            //ProcessBuffer(&msg);
 
             if (verbose_print_count_ >= kMaxLogSize) [[unlikely]]
                 RefreshFd(true);
